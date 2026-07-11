@@ -1,0 +1,19 @@
+services:
+  video-dl-bot:
+    build: .
+    image: video-dl-bot:local
+    container_name: video-dl-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      WHITELIST_FILE: /data/whitelist.json
+      PID_FILE: /tmp/video-dl-bot.pid
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      JS_RUNTIMES: node
+    volumes:
+      - ./data:/data
+      # Раскомментируйте для cookies (YouTube и др.):
+      # - ./cookies.txt:/tmp/cookies.txt:ro
+    # command: ["--cookies-file=/tmp/cookies.txt"]
