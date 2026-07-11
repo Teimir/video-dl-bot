@@ -238,6 +238,12 @@
         },
         "maxConcurrentDownloads": {
           "oneOf": [{"type": "integer", "minimum": 1, "maximum": 100}, {"type": "null"}]
+        },
+        "adminIds": {
+          "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+        },
+        "whitelistFile": {
+          "oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
         }
       }
     }

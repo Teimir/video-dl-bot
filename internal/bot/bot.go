@@ -11,6 +11,7 @@ import (
 	tele "gopkg.in/telebot.v4"
 
 	"gh.tarampamp.am/video-dl-bot/internal/filestorage"
+	"gh.tarampamp.am/video-dl-bot/internal/whitelist"
 	ytdlp "gh.tarampamp.am/video-dl-bot/internal/yt-dlp"
 )
 
@@ -23,8 +24,10 @@ const (
 
 // Chat actions to simulate activity status.
 const (
-	actDownloading = tele.RecordingVideo
-	actUploading   = tele.UploadingVideo
+	actDownloadingVideo = tele.RecordingVideo
+	actUploadingVideo   = tele.UploadingVideo
+	actDownloadingAudio = tele.RecordingAudio
+	actUploadingAudio   = tele.UploadingAudio
 )
 
 type (
@@ -33,6 +36,8 @@ type (
 		cookiesFile            string // path to the cookies file (if any)
 		jsRuntimes             string // JavaScript runtimes for yt-dlp (e.g., "node", "bun", "deno", "quickjs")
 		maxConcurrentDownloads uint   // maximum number of concurrent downloads allowed
+		whitelist              *whitelist.Store
+		adminIDs               map[int64]struct{}
 
 		log    *slog.Logger
 		client *tele.Bot
@@ -56,6 +61,19 @@ func WithMaxConcurrentDownloads(n uint) Option {
 	return func(b *Bot) { b.maxConcurrentDownloads = max(1, min(100, n)) } //nolint:mnd
 }
 
+// WithWhitelist sets the whitelist store used for access control.
+func WithWhitelist(store *whitelist.Store) Option { return func(b *Bot) { b.whitelist = store } }
+
+// WithAdminIDs sets Telegram user IDs that can manage the whitelist.
+func WithAdminIDs(ids []int64) Option {
+	return func(b *Bot) {
+		b.adminIDs = make(map[int64]struct{}, len(ids))
+		for _, id := range ids {
+			b.adminIDs[id] = struct{}{}
+		}
+	}
+}
+
 // NewBot creates and returns a new instance of Bot.
 func NewBot(ctx context.Context, token string, opts ...Option) (*Bot, error) {
 	const pollerTimeout = 10 * time.Second // default timeout for the long poller
@@ -66,6 +84,14 @@ func NewBot(ctx context.Context, token string, opts ...Option) (*Bot, error) {
 
 	for _, opt := range opts {
 		opt(&bot)
+	}
+
+	if bot.whitelist == nil {
+		return nil, fmt.Errorf("whitelist store is required")
+	}
+
+	if len(bot.adminIDs) == 0 {
+		return nil, fmt.Errorf("at least one admin id is required")
 	}
 
 	client, err := tele.NewBot(tele.Settings{
@@ -88,13 +114,15 @@ func NewBot(ctx context.Context, token string, opts ...Option) (*Bot, error) {
 
 	var lim = make(Limiter, bot.maxConcurrentDownloads)
 
-	// register command and message handlers
-	client.Handle("/start", bot.handleStartCommand())
-	client.Handle("test", bot.handleTestCommand())
+	client.Handle("/start", bot.withAccess(bot.handleStartCommand()))
+	client.Handle("test", bot.withAccess(bot.handleTestCommand()))
+	client.Handle("/allow", bot.handleAllowCommand())
+	client.Handle("/deny", bot.handleDenyCommand())
+	client.Handle("/users", bot.handleUsersCommand())
+	client.Handle("/whoami", bot.handleWhoamiCommand())
 
-	var msgHandler = bot.handleMessages(ctx, lim)
+	var msgHandler = bot.withAccess(bot.handleMessages(ctx, lim))
 
-	// handle multiple event types with the same message handler
 	for _, event := range [...]string{tele.OnText, tele.OnForward, tele.OnReply} {
 		client.Handle(event, msgHandler)
 	}
@@ -106,7 +134,6 @@ func NewBot(ctx context.Context, token string, opts ...Option) (*Bot, error) {
 func (b *Bot) Start(ctx context.Context) {
 	var stopped = make(chan struct{})
 
-	// stop bot when context is canceled
 	go func() {
 		defer close(stopped)
 
@@ -114,7 +141,6 @@ func (b *Bot) Start(ctx context.Context) {
 		b.client.Stop()
 	}()
 
-	// blocking call that listens to updates
 	b.client.Start()
 
 	<-stopped
@@ -123,9 +149,14 @@ func (b *Bot) Start(ctx context.Context) {
 // handleStartCommand returns a handler for the "/start" command.
 func (b *Bot) handleStartCommand() tele.HandlerFunc {
 	return func(c tele.Context) (err error) {
-		return b.reply(c.Message(), fmt.Sprintf(`Hello %s! I can help you download videos from hundreds of websites.
+		return b.reply(c.Message(), fmt.Sprintf(`Hello %s! I can help you download videos and audio from hundreds of websites.
 
-Please send or forward me a video URL, and I'll do my best to download it for you!`,
+Send me a video URL to download the video.
+Prefix a URL with "mp3" or "audio" to download MP3 instead.
+
+Examples:
+- https://www.youtube.com/watch?v=dQw4w9WgXcQ
+- mp3 https://www.youtube.com/watch?v=dQw4w9WgXcQ`,
 			c.Sender().FirstName,
 		))
 	}
@@ -136,20 +167,19 @@ func (b *Bot) handleTestCommand() tele.HandlerFunc {
 	return func(c tele.Context) (err error) {
 		return b.reply(
 			c.Message(),
-			"Just send me a video URL or forward a message containing a link, "+
-				"and I'll download it - that would be the perfect test!",
+			"Send me a video URL or prefix it with mp3/audio for audio download.",
 		)
 	}
 }
 
-// handleMessages processes incoming user messages and attempts to download video content.
+// handleMessages processes incoming user messages and attempts to download media content.
 func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc { //nolint:funlen
-	const errWrongMessageReplyMd2 = "Please provide a valid video link\\." +
+	const errWrongMessageReplyMd2 = "Please provide a valid link\\." +
 		"\n" +
 		"\n" +
 		"Examples:\n" +
 		"\\- `https://www\\.youtube\\.com/watch?v=dQw4w9WgXcQ`\n" +
-		"\\- `youtu\\.be/dQw4w9WgXcQ`\n" +
+		"\\- `mp3 https://www\\.youtube\\.com/watch?v=dQw4w9WgXcQ`\n" +
 		"\n" +
 		"You can also share a link to an Instagram reel, TikTok video, or any other video you'd like to download\\. " +
 		"Hundreds of sites are supported, so feel free to give it a try\\!"
@@ -159,12 +189,11 @@ func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc
 		defer cancel()
 
 		var (
-			user, userMsg       = c.Sender(), c.Message()
-			userUrl, userUrlErr = ExtractLink(c.Text())
+			user, userMsg = c.Sender(), c.Message()
+			mediaType, userURL, userURLErr = ParseMediaRequest(c.Text())
 		)
 
-		// invalid link - inform user and react
-		if userUrlErr != nil {
+		if userURLErr != nil {
 			_ = b.react(user, userMsg, emojiBadRequest)
 
 			b.log.Info("received invalid link from user",
@@ -180,24 +209,37 @@ func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc
 			})
 		}
 
-		b.log.Info("received video download request",
+		isAudio := mediaType == MediaAudio
+
+		b.log.Info("received media download request",
 			slog.String("sender_name", user.FirstName),
 			slog.Int64("sender_id", user.ID),
-			slog.String("video_url", userUrl.String()),
+			slog.String("media_url", userURL.String()),
+			slog.Bool("is_audio", isAudio),
 		)
 
-		// limit concurrent downloads via semaphore
 		if err := lim.Acquire(ctx); err != nil {
 			return err
 		}
 		defer lim.Release()
 
-		// clear any previous reactions once we're done
 		defer func() { _ = b.clearReactions(user, userMsg) }()
 
-		// indicate download in progress
+		var (
+			downloadAction tele.ChatAction
+			uploadAction   tele.ChatAction
+		)
+
+		if isAudio {
+			downloadAction = actDownloadingAudio
+			uploadAction = actUploadingAudio
+		} else {
+			downloadAction = actDownloadingVideo
+			uploadAction = actUploadingVideo
+		}
+
 		_ = b.react(user, userMsg, emojiDownloading)
-		stopDownloadingAction := b.setChatAction(ctx, user, actDownloading)
+		stopDownloadingAction := b.setChatAction(ctx, user, downloadAction)
 
 		defer stopDownloadingAction()
 
@@ -211,46 +253,60 @@ func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc
 			ytDlpOpts = append(ytDlpOpts, ytdlp.WithJSRuntimes(b.jsRuntimes))
 		}
 
-		// download the video
-		dl, dlErr := ytdlp.Download(ctx, userUrl.String(), ytDlpOpts...)
+		var (
+			dl    *ytdlp.Downloaded
+			dlErr error
+		)
+
+		if isAudio {
+			dl, dlErr = ytdlp.DownloadAudio(ctx, userURL.String(), ytDlpOpts...)
+		} else {
+			dl, dlErr = ytdlp.Download(ctx, userURL.String(), ytDlpOpts...)
+		}
+
 		if dlErr != nil {
-			b.log.Error("failed to download video",
+			mediaLabel := "video"
+			if isAudio {
+				mediaLabel = "audio"
+			}
+
+			b.log.Error("failed to download media",
 				slog.String("error", dlErr.Error()),
 				slog.String("sender_name", user.FirstName),
 				slog.Int64("sender_id", user.ID),
-				slog.String("video_url", userUrl.String()),
+				slog.String("media_url", userURL.String()),
+				slog.Bool("is_audio", isAudio),
 			)
 
-			return b.reply(userMsg, "❌ Failed to download video")
+			return b.reply(userMsg, fmt.Sprintf("❌ Failed to download %s", mediaLabel))
 		}
 
 		stopDownloadingAction()
 
-		// stat the file to get size info
 		stat, statErr := os.Stat(dl.Filepath)
 		if statErr != nil {
-			b.log.Error("failed to stat downloaded video file",
+			b.log.Error("failed to stat downloaded media file",
 				slog.String("error", statErr.Error()),
 				slog.String("file_path", dl.Filepath),
 				slog.String("sender_name", user.FirstName),
 				slog.Int64("sender_id", user.ID),
-				slog.String("video_url", userUrl.String()),
+				slog.String("media_url", userURL.String()),
 			)
 
-			return b.reply(userMsg, "❌ Downloaded video file not available")
+			return b.reply(userMsg, "❌ Downloaded file not available")
 		}
 
-		b.log.Debug("successfully downloaded video",
+		b.log.Debug("successfully downloaded media",
 			slog.String("file_path", dl.Filepath),
 			slog.String("sender_name", user.FirstName),
 			slog.Int64("sender_id", user.ID),
-			slog.String("video_url", userUrl.String()),
+			slog.String("media_url", userURL.String()),
 			slog.Int64("file_size", stat.Size()),
+			slog.Bool("is_audio", isAudio),
 		)
 
-		defer func() { _ = os.Remove(dl.Filepath) }() // clean up the downloaded file after sending
+		defer func() { _ = os.Remove(dl.Filepath) }()
 
-		// open the downloaded file
 		fp, fpErr := os.Open(dl.Filepath)
 		if fpErr != nil {
 			return fpErr
@@ -258,23 +314,37 @@ func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc
 
 		defer func() { _ = fp.Close() }()
 
-		// indicate upload in progress
 		_ = b.react(user, userMsg, emojiUploading)
-		stopUploadingAction := b.setChatAction(ctx, user, actUploading)
+		stopUploadingAction := b.setChatAction(ctx, user, uploadAction)
 
 		defer stopUploadingAction()
 
 		var fileSizeMb = float64(stat.Size()) / 1024 / 1024 // file size in MB
 
-		// telegram upload limit is 50MB
 		if fileSizeMb <= 50 { //nolint:mnd
-			if err := b.replyWithVideo(userMsg, tele.Video{File: tele.FromReader(fp)}); err != nil {
+			if isAudio {
+				if err := b.replyWithAudio(userMsg, tele.Audio{File: tele.FromReader(fp)}); err != nil {
+					b.log.Error("failed to upload audio to Telegram",
+						slog.String("error", err.Error()),
+						slog.Int64("file_size", stat.Size()),
+						slog.String("sender_name", user.FirstName),
+						slog.Int64("sender_id", user.ID),
+						slog.String("media_url", userURL.String()),
+					)
+
+					return b.reply(userMsg, fmt.Sprintf(
+						"❌ Failed to send audio (%.2f MB): %s",
+						fileSizeMb,
+						err.Error(),
+					))
+				}
+			} else if err := b.replyWithVideo(userMsg, tele.Video{File: tele.FromReader(fp)}); err != nil {
 				b.log.Error("failed to upload video to Telegram",
 					slog.String("error", err.Error()),
 					slog.Int64("file_size", stat.Size()),
 					slog.String("sender_name", user.FirstName),
 					slog.Int64("sender_id", user.ID),
-					slog.String("video_url", userUrl.String()),
+					slog.String("media_url", userURL.String()),
 				)
 
 				return b.reply(userMsg, fmt.Sprintf(
@@ -284,28 +354,40 @@ func (b *Bot) handleMessages(pCtx context.Context, lim Limiter) tele.HandlerFunc
 				))
 			}
 		} else {
-			// upload to file hosting if file is too large
-			fileUrl, urlErr := filestorage.UploadToFileBin(ctx, fp, fmt.Sprintf("video%s", filepath.Ext(dl.Filepath)))
+			fileName := fmt.Sprintf("video%s", filepath.Ext(dl.Filepath))
+			linkLabel := fmt.Sprintf("🚀 Download video (%.2f MB)", fileSizeMb)
+			readyText := fmt.Sprintf(
+				"[Your video](%s) is ready for download _\\(the link will expire in a couple of days\\)_:",
+				userURL.String(),
+			)
+
+			if isAudio {
+				fileName = fmt.Sprintf("audio%s", filepath.Ext(dl.Filepath))
+				linkLabel = fmt.Sprintf("🚀 Download audio (%.2f MB)", fileSizeMb)
+				readyText = fmt.Sprintf(
+					"[Your audio](%s) is ready for download _\\(the link will expire in a couple of days\\)_:",
+					userURL.String(),
+				)
+			}
+
+			fileURL, urlErr := filestorage.UploadToFileBin(ctx, fp, fileName)
 			if urlErr != nil {
-				b.log.Error("failed to upload video file to file hosting",
+				b.log.Error("failed to upload media file to file hosting",
 					slog.String("error", urlErr.Error()),
 					slog.Int64("file_size", stat.Size()),
 					slog.String("sender_name", user.FirstName),
 					slog.Int64("sender_id", user.ID),
-					slog.String("video_url", userUrl.String()),
+					slog.String("media_url", userURL.String()),
 				)
 
-				return b.reply(userMsg, "❌ Failed to upload video to file hosting")
+				return b.reply(userMsg, "❌ Failed to upload file to file hosting")
 			}
 
 			return b.replyWithLink(
 				userMsg,
-				fmt.Sprintf(
-					"[Your video](%s) is ready for download _\\(the link will expire in a couple of days\\)_:",
-					userUrl.String(),
-				),
-				fmt.Sprintf("🚀 Download video (%.2f MB)", fileSizeMb),
-				fileUrl,
+				readyText,
+				linkLabel,
+				fileURL,
 				&tele.SendOptions{
 					ParseMode:             tele.ModeMarkdownV2,
 					DisableWebPagePreview: true,
@@ -334,6 +416,16 @@ func (b *Bot) replyWithVideo(to *tele.Message, v tele.Video) (err error) {
 	_, err = b.client.Reply(to, &v)
 	if err != nil {
 		_, err = b.client.Send(to.Sender, &v)
+	}
+
+	return
+}
+
+// replyWithAudio sends an audio file either as a reply or a fresh message.
+func (b *Bot) replyWithAudio(to *tele.Message, a tele.Audio) (err error) {
+	_, err = b.client.Reply(to, &a)
+	if err != nil {
+		_, err = b.client.Send(to.Sender, &a)
 	}
 
 	return
@@ -380,9 +472,9 @@ func (b *Bot) clearReactions(to tele.Recipient, msg tele.Editable) error {
 
 // setChatAction periodically sends a chat action (e.g., typing). Returns a function to stop the action.
 func (b *Bot) setChatAction(ctx context.Context, user *tele.User, action tele.ChatAction) (stop func()) {
-	ctx, stop = context.WithCancel(ctx) // override the parent context to allow cancellation
+	ctx, stop = context.WithCancel(ctx)
 
-	const interval = 4*time.Second + 500*time.Millisecond // 5 seconds is Telegram's recommended interval
+	const interval = 4*time.Second + 500*time.Millisecond
 
 	go func() {
 		defer stop()

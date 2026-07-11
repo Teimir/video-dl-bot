@@ -97,6 +97,12 @@ spec:
             {{- if .maxConcurrentDownloads }}
             - {name: MAX_CONCURRENT_DOWNLOADS, value: "{{ .maxConcurrentDownloads }}"}
             {{- end }}
+            {{- if .adminIds }}
+            - {name: ADMIN_IDS, value: "{{ .adminIds }}"}
+            {{- end }}
+            {{- if .whitelistFile }}
+            - {name: WHITELIST_FILE, value: "{{ .whitelistFile }}"}
+            {{- end }}
             {{- end }}
             {{- with $.Values.deployment.env }}
             {{- tpl (toYaml .) $ | nindent 12 }}

@@ -16,6 +16,7 @@ import (
 	"gh.tarampamp.am/video-dl-bot/internal/cli/cmd"
 	"gh.tarampamp.am/video-dl-bot/internal/logger"
 	"gh.tarampamp.am/video-dl-bot/internal/version"
+	"gh.tarampamp.am/video-dl-bot/internal/whitelist"
 )
 
 //go:generate go run ./generate/readme.go
@@ -29,9 +30,36 @@ type App struct {
 
 		BotToken               string
 		CookiesFile            string
-		JSRuntimes             string // JavaScript runtimes for yt-dlp
+		JSRuntimes             string
 		MaxConcurrentDownloads uint
+		AdminIDs               string
+		WhitelistFile          string
 	}
+}
+
+func parseAdminIDs(raw string) ([]int64, error) {
+	parts := strings.Split(raw, ",")
+	ids := make([]int64, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid admin id %q", part)
+		}
+
+		ids = append(ids, id)
+	}
+
+	if len(ids) == 0 {
+		return nil, errors.New("at least one admin id is required")
+	}
+
+	return ids, nil
 }
 
 // NewApp initializes a new CLI application instance.
@@ -44,10 +72,9 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 		},
 	}
 
-	// set default options
 	app.opt.MaxConcurrentDownloads = 5
+	app.opt.WhitelistFile = "./whitelist.json"
 
-	// define CLI flags with validation
 	var (
 		logLevelFlag = cmd.Flag[string]{
 			Names:   []string{"log-level"},
@@ -120,11 +147,9 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 			Default: app.opt.JSRuntimes,
 			Validator: func(_ *cmd.Command, v string) error {
 				if v == "" {
-					return nil // allow empty value (yt-dlp will use its own defaults)
+					return nil
 				}
 
-				// deny quotes and semicolons to prevent command injection, as these runtimes are passed to yt-dlp
-				// which may execute them
 				for _, char := range v {
 					if char == '"' || char == '\'' || char == ';' || char == '&' || char == '|' {
 						return fmt.Errorf("js runtimes cannot contain quotes, semicolons, or shell operators")
@@ -147,6 +172,32 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 				return nil
 			},
 		}
+		adminIDsFlag = cmd.Flag[string]{
+			Names:   []string{"admin-ids"},
+			Usage:   "Comma-separated Telegram user IDs of bot admins",
+			EnvVars: []string{"ADMIN_IDS"},
+			Default: app.opt.AdminIDs,
+			Validator: func(_ *cmd.Command, v string) error {
+				if _, err := parseAdminIDs(v); err != nil {
+					return err
+				}
+
+				return nil
+			},
+		}
+		whitelistFileFlag = cmd.Flag[string]{
+			Names:   []string{"whitelist-file"},
+			Usage:   "Path to the JSON file with whitelisted Telegram user IDs",
+			EnvVars: []string{"WHITELIST_FILE"},
+			Default: app.opt.WhitelistFile,
+			Validator: func(_ *cmd.Command, v string) error {
+				if v == "" {
+					return errors.New("whitelist file path is required")
+				}
+
+				return nil
+			},
+		}
 		pidFileFlag = cmd.Flag[string]{
 			Names:   []string{"pid-file"},
 			Usage:   "Path to the file where the process ID will be stored",
@@ -159,7 +210,7 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 
 				if _, err := os.Stat(app.opt.PidFile); err != nil {
 					if os.IsNotExist(err) {
-						return nil // it's okay - file shouldn't exist before the bot starts
+						return nil
 					}
 				}
 
@@ -179,18 +230,19 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 		&cookiesFileFlag,
 		&jsRuntimesFlag,
 		&maxConcurrentDownloadsFlag,
+		&adminIDsFlag,
+		&whitelistFileFlag,
 		&pidFileFlag,
 		&healthcheckFlag,
 	}
 
-	// define main command action
 	app.cmd.Action = func(ctx context.Context, c *cmd.Command, args []string) error {
 		var (
-			logLevel, _  = logger.ParseLevel(*logLevelFlag.Value)   // error ignored because the flag validates itself
-			logFormat, _ = logger.ParseFormat(*logFormatFlag.Value) // --//--
+			logLevel, _  = logger.ParseLevel(*logLevelFlag.Value)
+			logFormat, _ = logger.ParseFormat(*logFormatFlag.Value)
 		)
 
-		log, logErr := logger.New(logLevel, logFormat) // create new logger instance
+		log, logErr := logger.New(logLevel, logFormat)
 		if logErr != nil {
 			return logErr
 		}
@@ -201,6 +253,8 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 		setIfFlagIsSet(&app.opt.CookiesFile, cookiesFileFlag)
 		setIfFlagIsSet(&app.opt.JSRuntimes, jsRuntimesFlag)
 		setIfFlagIsSet(&app.opt.MaxConcurrentDownloads, maxConcurrentDownloadsFlag)
+		setIfFlagIsSet(&app.opt.AdminIDs, adminIDsFlag)
+		setIfFlagIsSet(&app.opt.WhitelistFile, whitelistFileFlag)
 
 		if app.opt.DoHealthcheck {
 			if app.opt.PidFile == "" {
@@ -217,41 +271,30 @@ func NewApp(name string) *App { //nolint:funlen,gocognit,gocyclo
 				return fmt.Errorf("invalid pid in file %s: %w", app.opt.PidFile, err)
 			}
 
-			// check if process is alive. if sig is 0, then no signal is sent, but error checking is still per‐
-			// formed; this can be used to check for the existence of a process ID or process group ID
 			if err = syscall.Kill(pid, syscall.Signal(0)); err != nil {
 				return errors.New("process is not running")
 			}
 
 			log.Info("healthcheck successful", slog.Int("pid", pid), slog.String("pid_file", app.opt.PidFile))
 
-			return nil // healthcheck successful
+			return nil
 		}
 
 		if app.opt.PidFile != "" {
-			// the file shouldn't exist before the bot starts, so we check if it exists
 			if _, err := os.Stat(app.opt.PidFile); err == nil {
 				return fmt.Errorf("pid file already exists: %s (another instance may be running)", app.opt.PidFile)
 			}
 
-			// write the PID to the specified file
 			if err := os.WriteFile(app.opt.PidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil { //nolint:gosec,mnd
 				return fmt.Errorf("failed to write PID file: %w", err)
 			}
 
 			log.Info("pid file created", "path", app.opt.PidFile)
 
-			defer func() { _ = os.Remove(app.opt.PidFile) }() // remove PID file on exit
+			defer func() { _ = os.Remove(app.opt.PidFile) }()
 		}
 
 		if app.opt.CookiesFile != "" {
-			// Copy the file with cookies if it is set through environment variables, to
-			// avoid issues with read-only mounted secrets like this one:
-			//
-			// File \"/usr/bin/yt-dlp/__main__.py\", line 17, in <module>;
-			// ...
-			// with open(file, 'w' if write else 'r', encoding='utf-8')
-			// OSError: [Errno 30] Read-only file system: '/cookies.txt'
 			content, rErr := os.ReadFile(app.opt.CookiesFile)
 			if rErr != nil {
 				return fmt.Errorf("failed to read cookies file: %w", rErr)
@@ -296,9 +339,21 @@ func (a *App) Help() string { return a.cmd.Help() }
 
 // run contains the main bot initialization and event loop.
 func (a *App) run(ctx context.Context, log *slog.Logger) error {
+	adminIDs, err := parseAdminIDs(a.opt.AdminIDs)
+	if err != nil {
+		return err
+	}
+
+	whitelistStore, err := whitelist.NewStore(a.opt.WhitelistFile)
+	if err != nil {
+		return fmt.Errorf("failed to initialize whitelist: %w", err)
+	}
+
 	var botOpts = []bot.Option{
 		bot.WithLogger(log.With("source", "telebot")),
 		bot.WithMaxConcurrentDownloads(a.opt.MaxConcurrentDownloads),
+		bot.WithWhitelist(whitelistStore),
+		bot.WithAdminIDs(adminIDs),
 	}
 
 	if a.opt.CookiesFile != "" {
@@ -319,9 +374,9 @@ func (a *App) run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("failed to create bot: %w", err)
 	}
 
-	log.Info("starting bot")
+	log.Info("starting bot", slog.String("whitelist_file", a.opt.WhitelistFile))
 
-	b.Start(ctx) // blocking call
+	b.Start(ctx)
 
 	log.Info("bot stopped")
 

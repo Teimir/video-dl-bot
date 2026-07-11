@@ -50,9 +50,13 @@ deployment:
       maxUnavailable: 1 # the old Pod will be terminated before a new one is started
   # -- Additional volumes to add to the pod, more information can be found here:
   #    https://kubernetes.io/docs/concepts/storage/volumes/
-  volumes: [] # supports templating
+  volumes:
+    - name: whitelist-data
+      emptyDir: {}
   # -- Additional volumeMounts to add to the container (for instance when using fs storage driver)
-  volumeMounts: [] # supports templating
+  volumeMounts:
+    - name: whitelist-data
+      mountPath: /data
   # -- Node selector for pod assignment, more information can be found here:
   #    https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
   nodeSelector: {} # supports templating
@@ -103,3 +107,10 @@ config:
   # -- Maximum number of concurrent downloads
   # @default 5
   maxConcurrentDownloads: null
+
+  # -- Comma-separated Telegram user IDs of bot admins (required)
+  adminIds: null
+
+  # -- Path to the JSON file with whitelisted Telegram user IDs
+  # @default /data/whitelist.json (defined in the Dockerfile)
+  whitelistFile: null

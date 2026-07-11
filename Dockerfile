@@ -90,5 +90,6 @@ LABEL \
 
 USER 10001:10001
 WORKDIR /tmp
-ENV HOME=/tmp LOG_FORMAT=json LOG_LEVEL=info JS_RUNTIMES=node PID_FILE=/tmp/video-dl-bot.pid
+ENV HOME=/tmp LOG_FORMAT=json LOG_LEVEL=info JS_RUNTIMES=node PID_FILE=/tmp/video-dl-bot.pid WHITELIST_FILE=/data/whitelist.json
+VOLUME ["/data"]
 ENTRYPOINT ["/bin/video-dl-bot"]

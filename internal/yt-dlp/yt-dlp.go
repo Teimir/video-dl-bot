@@ -83,86 +83,99 @@ func (o options) Apply(opts ...Option) options {
 }
 
 // Download downloads a single video from the given URL using yt-dlp.
-// It writes output to a temp directory and returns structured metadata.
+func Download(ctx context.Context, in string, opts ...Option) (*Downloaded, error) {
+	return download(ctx, in, ".mp4", videoFormatArgs(), opts...)
+}
+
+// DownloadAudio downloads audio from the given URL and converts it to MP3.
+func DownloadAudio(ctx context.Context, in string, opts ...Option) (*Downloaded, error) {
+	return download(ctx, in, ".mp3", audioFormatArgs(), opts...)
+}
+
+func videoFormatArgs() []string {
+	return []string{
+		// https://github.com/yt-dlp/yt-dlp?tab=readme-ov-file#format-selection
+		"--format", "bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]/bv*[ext=mp4]+ba[ext=m4a]/best[filesize<2G]/best",
+		"--no-post-overwrites",
+		"--no-embed-info-json",
+	}
+}
+
+func audioFormatArgs() []string {
+	return []string{
+		"--format", "bestaudio/best",
+		"--extract-audio",
+		"--audio-format", "mp3",
+		"--audio-quality", "0",
+		"--no-post-overwrites",
+		"--no-embed-info-json",
+	}
+}
+
+func baseDownloadArgs(tmpDir string) []string {
+	return []string{
+		"--ignore-config",
+		"--color", "never",
+		"--min-filesize", "50k",
+		"--max-filesize", "2G",
+		"--no-playlist",
+		"--concurrent-fragments", "1",
+		"--retries", "5",
+		"--fragment-retries", "5",
+		"--abort-on-unavailable-fragments",
+		"--paths", tmpDir,
+		"--output", "result.%(ext)s",
+		"--restrict-filenames",
+		"--trim-filenames", "128",
+		"--no-overwrites",
+		"--no-continue",
+		"--no-mtime",
+		"--write-info-json",
+		"--no-write-comments",
+		"--cache-dir", os.TempDir(),
+		"--no-progress",
+	}
+}
+
+// download writes output to a temp directory and returns structured metadata.
 // The caller is responsible for cleaning up the downloaded file.
 // TODO: make file size limits configurable via options.
-func Download(ctx context.Context, in string, opts ...Option) (_ *Downloaded, outErr error) { //nolint:funlen
-	// defer error wrapping to include module-specific prefix
+func download(ctx context.Context, in, expectedExt string, formatArgs []string, opts ...Option) (_ *Downloaded, outErr error) { //nolint:funlen
 	defer func() {
 		if outErr != nil {
 			outErr = fmt.Errorf("%s: %w", errPrefix, outErr)
 		}
 	}()
 
-	// create temporary directory for download
 	tmpDir, tmpErr := os.MkdirTemp("", "yt-dlp-*")
 	if tmpErr != nil {
 		return nil, fmt.Errorf("failed to create temporary directory: %w", tmpErr)
 	}
 
-	defer func() { _ = os.RemoveAll(tmpDir) }() // clean up the temporary directory on return
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	// initialize options
 	var (
 		o    = options{}.Apply(opts...)
-		args = []string{
-			// general options
-			"--ignore-config",  // don't load any more configuration files except those given to --config-locations
-			"--color", "never", // disable colored output
-			// video selection
-			"--min-filesize", "50k", // abort download if filesize is smaller than
-			"--max-filesize", "2G", // abort download if filesize is larger than
-			"--no-playlist", // download only the video, if the URL refers to a video and a playlist
-			// download options
-			"--concurrent-fragments", "1", // number of fragments of a dash/hlsnative video that should be downloaded conc-ly
-			"--retries", "5", // number of retries (default is 10), or "infinite"
-			"--fragment-retries", "5", // number of retries for a fragment (default is 10), or "infinite"
-			"--abort-on-unavailable-fragments", // abort download if a fragment is unavailable
-			// filesystem options
-			"--paths", tmpDir, // set the path to the temporary directory
-			// output filename template (https://github.com/yt-dlp/yt-dlp?tab=readme-ov-file#output-template)
-			"--output", "result.%(ext)s",
-			"--restrict-filenames",    // restrict filenames to only ASCII characters, and avoid "&" and spaces in filenames
-			"--trim-filenames", "128", // limit the filename length (excluding extension)
-			"--no-overwrites",           // do not overwrite any files
-			"--no-continue",             // do not resume partially downloaded fragments
-			"--no-mtime",                // do not use the Last-modified header to set the file modification time
-			"--write-info-json",         // write video metadata to a .info.json file
-			"--no-write-comments",       // do not retrieve video comments unless the extraction is known to be quick
-			"--cache-dir", os.TempDir(), // where yt-dlp can store some downloaded information permanently
-			// verbosity and simulation options
-			"--no-progress", // do not print progress bar
-			// video format options
-			// https://github.com/yt-dlp/yt-dlp?tab=readme-ov-file#format-selection
-			"--format", "bv*[ext=mp4][filesize<2G]+ba[ext=m4a][filesize<2G]/bv*[ext=mp4]+ba[ext=m4a]/best[filesize<2G]/best",
-			"--no-post-overwrites", // do not overwrite post-processed files
-			"--no-embed-info-json", // do not embed the infojson as an attachment to the video file
-		}
+		args = append(baseDownloadArgs(tmpDir), formatArgs...)
 	)
 
 	if o.cookiesFile != "" {
-		args = append(args,
-			"--cookies", // Netscape formatted file to read cookies from
-			o.cookiesFile,
-		)
+		args = append(args, "--cookies", o.cookiesFile)
 	}
 
 	if o.jsRuntimes != "" {
 		args = append(args, "--js-runtimes", o.jsRuntimes)
 	}
 
-	// run yt-dlp with selected flags
 	if _, err := o.runner.Run(ctx, o.exePath, append(args, in)...); err != nil {
 		return nil, fmt.Errorf("failed to download: %w", err)
 	}
 
-	// construct paths for result and metadata files
 	var (
-		resultFile = filepath.Join(tmpDir, "result.mp4")
+		resultFile = filepath.Join(tmpDir, "result"+expectedExt)
 		infoFile   = filepath.Join(tmpDir, "result.info.json")
 	)
 
-	// ensure the result file exists
 	if _, err := os.Stat(resultFile); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("result file does not exist: %s", resultFile)
@@ -171,7 +184,6 @@ func Download(ctx context.Context, in string, opts ...Option) (_ *Downloaded, ou
 		return nil, err
 	}
 
-	// ensure the metadata file exists
 	if _, err := os.Stat(infoFile); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("info file does not exist: %s", infoFile)
@@ -192,35 +204,30 @@ func Download(ctx context.Context, in string, opts ...Option) (_ *Downloaded, ou
 		Duration    float32 `json:"duration"`
 	}
 
-	{ // open and decode metadata JSON file
-		fp, fpErr := os.Open(infoFile)
-		if fpErr != nil {
-			return nil, fmt.Errorf("failed to open info file: %w", fpErr)
-		}
-
-		defer func() { _ = fp.Close() }() // ensure the file is closed after reading
-
-		if err := json.NewDecoder(fp).Decode(&info); err != nil {
-			return nil, fmt.Errorf("failed to decode info file: %w", err)
-		}
+	fp, fpErr := os.Open(infoFile)
+	if fpErr != nil {
+		return nil, fmt.Errorf("failed to open info file: %w", fpErr)
 	}
 
-	{ // move the video to a stable temporary path (ensures file won't disappear on return)
-		newTmpFile, newTmpErr := os.CreateTemp("", fmt.Sprintf("yt-dlp-result-*%s", filepath.Ext(resultFile)))
-		if newTmpErr != nil {
-			return nil, newTmpErr
-		}
+	defer func() { _ = fp.Close() }()
 
-		_ = newTmpFile.Close()
-
-		if err := os.Rename(resultFile, newTmpFile.Name()); err != nil {
-			return nil, err
-		}
-
-		resultFile = newTmpFile.Name() // update result path
+	if err := json.NewDecoder(fp).Decode(&info); err != nil {
+		return nil, fmt.Errorf("failed to decode info file: %w", err)
 	}
 
-	// return metadata and final file path
+	newTmpFile, newTmpErr := os.CreateTemp("", fmt.Sprintf("yt-dlp-result-*%s", filepath.Ext(resultFile)))
+	if newTmpErr != nil {
+		return nil, newTmpErr
+	}
+
+	_ = newTmpFile.Close()
+
+	if err := os.Rename(resultFile, newTmpFile.Name()); err != nil {
+		return nil, err
+	}
+
+	resultFile = newTmpFile.Name()
+
 	return &Downloaded{
 		Filepath:    resultFile,
 		ID:          info.ID,
