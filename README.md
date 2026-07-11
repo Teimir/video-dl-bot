@@ -9,18 +9,21 @@
 
 # video-dl-bot
 
-A Telegram bot for downloading videos from various platforms directly within Telegram. Built with Go and
+A Telegram bot for downloading videos and audio from various platforms directly within Telegram. Built with Go and
 powered by `yt-dlp`, it supports downloading from any platform that `yt-dlp` supports.
 
 ## 🔥 Features
 
 - **Universal Video Download**: Download videos from any platform supported by `yt-dlp`
   (YouTube, TikTok, Instagram, Twitter, and [hundreds more][yt-dlp-supported-sites])
+- **MP3 Download**: Prefix a URL with `mp3` or `audio` to download audio as MP3
+- **Access Control**: Whitelist-based access — only approved users can use the bot
+- **Admin Commands**: Manage the whitelist via `/allow`, `/deny`, `/users`, `/whoami`
 - **Smart File Handling**:
-  - Videos under 50 MB are sent directly in chat
+  - Files under 50 MB are sent directly in chat
   - Larger files are automatically uploaded to [filebin.net](https://filebin.net) with a direct download link
-- **Link Extraction**: Simply send or forward a message with a video link - no commands needed
-- **Visual Feedback**: The bot uses message reactions and status updates (e.g., "recording video") to show progress
+- **Link Extraction**: Simply send or forward a message with a link - no commands needed for downloads
+- **Visual Feedback**: The bot uses message reactions and status updates to show progress
 - **Concurrent Download Limiting**: Prevents resource overuse with configurable parallel download limits
 - **Cookie Support**: Authenticate with services like YouTube to bypass rate limits and access restricted content
 
@@ -28,16 +31,37 @@ powered by `yt-dlp`, it supports downloading from any platform that `yt-dlp` sup
 
 ## 👍 Usage
 
-Once your bot is running, simply send it a message containing a video link. The bot will:
+Once your bot is running, send it a message containing a link. The bot will:
 
 - Extract the URL from your message (works with forwarded messages too)
 - Show progress through message reactions
-- Update its status to show what it's doing (e.g., "recording video")
+- Update its status to show what it's doing
 - Either:
-  - Send the video directly in chat (if under 50 MB)
+  - Send the file directly in chat (if under 50 MB)
   - Upload to `filebin.net` and provide a download link (if over 50 MB)
 
-No special commands are needed - just send the link!
+### Download formats
+
+| Message | Result |
+|---------|--------|
+| `https://youtube.com/watch?v=...` | Video (MP4) |
+| `mp3 https://youtube.com/watch?v=...` | Audio (MP3) |
+| `audio https://youtube.com/watch?v=...` | Audio (MP3) |
+
+### Access control
+
+The bot uses a whitelist. Users not in the whitelist are silently ignored.
+
+Admins are configured via `ADMIN_IDS` at startup and have full access without being added to the whitelist.
+
+| Command | Description |
+|---------|-------------|
+| `/allow [id]` | Add user to whitelist (or reply to their message) |
+| `/deny [id]` | Remove user from whitelist |
+| `/users` | List whitelisted users |
+| `/whoami` | Show your Telegram ID |
+
+To find your Telegram ID, message [@userinfobot](https://t.me/userinfobot) or use `/whoami` as an admin.
 
 ## 🐋 Docker image
 
@@ -69,6 +93,8 @@ Image: ghcr.io/tarampampam/video-dl-bot:latest
 ```bash
 docker run -it --rm \
   -e BOT_TOKEN='your-telegram-bot-token' \
+  -e ADMIN_IDS='123456789' \
+  -v $(pwd)/data:/data \
   ghcr.io/tarampampam/video-dl-bot
 ```
 
@@ -77,6 +103,8 @@ With cookies file for YouTube (and other services) authentication:
 ```bash
 docker run -it --rm \
   -e BOT_TOKEN='your-telegram-bot-token' \
+  -e ADMIN_IDS='123456789' \
+  -v $(pwd)/data:/data \
   -v $(pwd)/cookies.txt:/tmp/cookies.txt:ro \
   ghcr.io/tarampampam/video-dl-bot:latest \
   --cookies-file=/tmp/cookies.txt
@@ -94,7 +122,9 @@ helm repo update
 Install the chart:
 
 ```bash
-helm install video-dl-bot video-dl-bot/video-dl-bot --set config.botToken.plain='your-telegram-bot-token'
+helm install video-dl-bot video-dl-bot/video-dl-bot \
+  --set config.botToken.plain='your-telegram-bot-token' \
+  --set config.adminIds='123456789'
 ```
 
 With cookies from a Kubernetes secret:
@@ -106,6 +136,7 @@ kubectl create secret generic bot-cookies --from-file=cookies.txt
 # Install with cookies mounted
 helm install video-dl-bot video-dl-bot/video-dl-bot \
   --set config.botToken.plain='your-telegram-bot-token' \
+  --set config.adminIds='123456789' \
   --set config.cookiesFile='/tmp/cookies.txt' \
   --set deployment.volumes[0].name='cookies' \
   --set deployment.volumes[0].secret.secretName='bot-cookies' \
@@ -131,15 +162,17 @@ For more configuration options, see the [Helm chart documentation][artifacthub].
 
 ### Environment Variables
 
-| Variable                   | Description                                                                                  | Default   |
-|----------------------------|----------------------------------------------------------------------------------------------|-----------|
-| `BOT_TOKEN`                | Telegram bot token (required)                                                                | -         |
-| `COOKIES_FILE`             | Path to cookies file in Netscape format                                                      | -         |
-| `JS_RUNTIMES`              | JavaScript runtimes for yt-dlp (e.g. `node`, `node:/path/to/node`, `bun`, `deno`, `quickjs`) | -         |
-| `MAX_CONCURRENT_DOWNLOADS` | Maximum number of parallel downloads                                                         | `5`       |
-| `LOG_LEVEL`                | Logging level: `debug`, `info`, `warn`, `error`                                              | `info`    |
-| `LOG_FORMAT`               | Logging format: `console`, `json`                                                            | `console` |
-| `PID_FILE`                 | Path to PID file for healthchecks                                                            | -         |
+| Variable                   | Description                                                                                  | Default              |
+|----------------------------|----------------------------------------------------------------------------------------------|----------------------|
+| `BOT_TOKEN`                | Telegram bot token (required)                                                                | -                    |
+| `ADMIN_IDS`                | Comma-separated Telegram user IDs of bot admins (required)                                   | -                    |
+| `WHITELIST_FILE`           | Path to JSON file with whitelisted user IDs                                                   | `./whitelist.json`   |
+| `COOKIES_FILE`             | Path to cookies file in Netscape format                                                      | -                    |
+| `JS_RUNTIMES`              | JavaScript runtimes for yt-dlp (e.g. `node`, `node:/path/to/node`, `bun`, `deno`, `quickjs`) | -                    |
+| `MAX_CONCURRENT_DOWNLOADS` | Maximum number of parallel downloads                                                         | `5`                  |
+| `LOG_LEVEL`                | Logging level: `debug`, `info`, `warn`, `error`                                              | `info`               |
+| `LOG_FORMAT`               | Logging format: `console`, `json`                                                            | `console`            |
+| `PID_FILE`                 | Path to PID file for healthchecks                                                            | -                    |
 
 <!--GENERATED:APP_README-->
 ## 💻 Command line interface
@@ -161,6 +194,8 @@ Options:
    --cookies-file="…", -c="…"              Path to the file with cookies (netscape-formatted) for the bot (optional) [$COOKIES_FILE]
    --js-runtimes="…"                       JavaScript runtimes for yt-dlp (e.g. 'node', 'node:/path/to/node', 'bun', 'deno', 'quickjs') [$JS_RUNTIMES]
    --max-concurrent-downloads="…", -m="…"  Maximum number of concurrent downloads (default: 5) [$MAX_CONCURRENT_DOWNLOADS]
+   --admin-ids="…"                         Comma-separated Telegram user IDs of bot admins [$ADMIN_IDS]
+   --whitelist-file="…"                    Path to the JSON file with whitelisted Telegram user IDs (default: ./whitelist.json) [$WHITELIST_FILE]
    --pid-file="…"                          Path to the file where the process ID will be stored [$PID_FILE]
    --healthcheck                           Check the health of the bot (useful for Docker/K8s healthcheck; pid file must be set) and exit
    --help, -h                              Show help
