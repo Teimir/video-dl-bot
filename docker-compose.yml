@@ -13,7 +13,13 @@ services:
       LOG_LEVEL: info
       JS_RUNTIMES: node
     volumes:
-      - ./data:/data
+      # Named volume avoids host permission issues on Linux.
+      - whitelist-data:/data
+      # Or bind-mount a host directory (entrypoint will chown it):
+      # - ./data:/data
       # Раскомментируйте для cookies (YouTube и др.):
       # - ./cookies.txt:/tmp/cookies.txt:ro
     # command: ["--cookies-file=/tmp/cookies.txt"]
+
+volumes:
+  whitelist-data:

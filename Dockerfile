@@ -75,6 +75,12 @@ COPY --from=ffmpeg /bin/ffmpeg /bin/ffprobe /bin/
 COPY --from=yt-dlp /bin/yt-dlp /bin/yt-dlp
 COPY --from=compiler /tmp/rootfs/bin/video-dl-bot /bin/video-dl-bot
 COPY --from=compiler /tmp/rootfs/etc/passwd /tmp/rootfs/etc/group /etc/
+COPY docker-entrypoint.sh /bin/docker-entrypoint.sh
+
+RUN chmod +x /bin/docker-entrypoint.sh \
+    && apt update \
+    && apt install -y --no-install-recommends util-linux \
+    && rm -r /var/lib/apt/lists/*
 
 ARG APP_VERSION="undefined@docker"
 
@@ -88,8 +94,8 @@ LABEL \
     org.opencontainers.version="$APP_VERSION" \
     org.opencontainers.image.licenses="MIT"
 
-USER 10001:10001
+USER root
 WORKDIR /tmp
 ENV HOME=/tmp LOG_FORMAT=json LOG_LEVEL=info JS_RUNTIMES=node PID_FILE=/tmp/video-dl-bot.pid WHITELIST_FILE=/data/whitelist.json
 VOLUME ["/data"]
-ENTRYPOINT ["/bin/video-dl-bot"]
+ENTRYPOINT ["/bin/docker-entrypoint.sh"]
